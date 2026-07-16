@@ -1,0 +1,13 @@
+[{:itonami.blueprint/id "cloud-itonami-isic-9820"
+  :itonami.blueprint/name "Undifferentiated Service-Producing Activities of Private Households for Own Use"
+  :itonami.blueprint/isic-rev4 "9820"
+  :itonami.blueprint/domain :services/household-time-use-survey-programme-coordination
+  :itonami.blueprint/license "AGPL-3.0-or-later"
+  :itonami.blueprint/social-impact [:statistical-visibility-of-unpaid-work :gender-equity-measurement
+                                     :care-economy-recognition :evidence-based-policy]
+  :itonami.blueprint/governor :time-use-programme-governor
+  :itonami.blueprint/robotics false
+  :itonami.blueprint/required-technologies [:identity :forms :dmn :bpmn :audit-ledger]
+  :itonami.blueprint/status :public-oss
+  :itonami.blueprint/maturity :implemented
+  :db/id -1}]
