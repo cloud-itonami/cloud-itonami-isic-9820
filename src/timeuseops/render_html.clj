@@ -416,6 +416,43 @@
      :with-approver (count found)
      :keys (vec (sort (distinct (map (comp kw->s first) found))))}))
 
+(defn- map-registers
+  "The map-valued registers on one committed record (`:value`, `:payload`,
+  ...), in sorted-key order."
+  [record]
+  (->> record
+       (filter (fn [[_ v]] (map? v)))
+       (sort-by (comp str key))
+       vec))
+
+(defn- approver-register-split
+  "MEASURED for ONE committed record: which of its map-valued registers
+  carry approver attribution and which do not."
+  [record]
+  (let [regs (map-registers record)]
+    {:with    (mapv (comp kw->s first) (filter (fn [[_ v]] (seq (approver-keys-in v))) regs))
+     :without (mapv (comp kw->s first) (remove (fn [[_ v]] (seq (approver-keys-in v))) regs))}))
+
+(defn- approver-divergence
+  "MEASURED at render time -- committed records on which SOME map register
+  carries the approver and ANOTHER register on the same record does not.
+
+  This is a real defect surface, not a cosmetic one: a consumer that reads
+  the register named in `:missing-from` gets a record that looks exactly
+  like an auto-committed one, so `nobody approved this` and `a human
+  approved this and the register did not carry it` become indistinguishable
+  downstream. Derived rather than asserted -- if the commit path is later
+  changed so every register carries the approver, `:count` falls to 0 and
+  the page stops reporting it by itself."
+  [db]
+  (let [splits (->> (store/coordination-log db)
+                    (map approver-register-split)
+                    (filter #(and (seq (:with %)) (seq (:without %))))
+                    vec)]
+    {:count        (count splits)
+     :carries      (vec (sort (distinct (mapcat :with splits))))
+     :missing-from (vec (sort (distinct (mapcat :without splits))))}))
+
 (defn- ledger-coverage
   "MEASURED at render time -- which fact types the graph emits into a run's
   `:audit` channel but the STORE ledger never receives. In this actor the
@@ -600,28 +637,41 @@
 (defn- trace-rows
   "Per-run trace built from each `g/run*` result: the graph's own
   disposition, its run status, and the audit facts it emitted -- including
-  the ones the store ledger never sees."
+  the ones the store ledger never sees.
+
+  The rollout phase is read from the run's own `:context` register -- the
+  phase the request was submitted under. A human RESUME carries no context
+  of its own (it resumes the thread the paused run created), so its phase
+  is looked up from the exec run that shares its `:thread-id` and labelled
+  as inherited, rather than rendered blank."
   [runs]
-  (->> runs
-       (map (fn [{:keys [thread label resume disposition status audit request]}]
-              (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+  (let [phase-of (into {} (keep (fn [{:keys [thread context]}]
+                                  (when-let [p (:phase context)] [thread p]))
+                                runs))]
+    (->> runs
+         (map (fn [{:keys [thread label resume disposition status audit context]}]
+                (let [own-phase (:phase context)
+                      ph        (or own-phase (get phase-of thread))]
+                  (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
                       (esc thread)
                       (if resume
                         (str "<span class=\"muted\">resume · </span>"
                              (esc (kw->s (:status resume))) " by <code>"
                              (esc (:by resume)) "</code>")
                         (esc label))
-                      (if request
-                        (str "phase " (esc (get-in request [:context :phase] "")) "")
-                        "")
+                      (if ph
+                        (str "phase " (esc ph)
+                             (when-not own-phase
+                               " <span class=\"muted\">(inherited)</span>"))
+                        "<span class=\"muted\">—</span>")
                       (case disposition
                         :commit "<span class=\"ok\">commit</span>"
                         :hold "<span class=\"critical\">hold</span>"
                         :escalate "<span class=\"warn\">escalate</span>"
                         (str "<span class=\"muted\">" (esc (kw->s (or disposition ""))) "</span>"))
                       (esc (kw->s (or status "")))
-                      (esc (str/join ", " (map (comp kw->s :t) audit))))))
-       (str/join "\n")))
+                      (esc (str/join ", " (map (comp kw->s :t) audit)))))))
+         (str/join "\n"))))
 
 ;; ----------------------------- document -----------------------------
 
@@ -658,6 +708,7 @@
         holds       (hold-facts ledger)
         hard        (filterv hard-hold? holds)
         retention   (store-retention db)
+        divergence  (approver-divergence db)
         coverage    (ledger-coverage db runs)
         hard-rules  (vec (sort (distinct (mapcat #(map kw->s (:basis %)) hard))))
         ;; every run that actually paused for a human
@@ -738,7 +789,18 @@
                  phase/default-phase)
          (format "<strong>Approver attribution — measured, not assumed:</strong> this repo's store retains NO approver key on any of its %d committed records, so the approver is not recoverable from the store. Where a run's audit channel carried an <code>:approval-granted</code> fact, the name below is joined from there instead and labelled as such."
                  (:records retention)))
-       "</p>\n")
+       "</p>\n"
+       ;; Derived defect disclosure. Measured by differencing the record's
+       ;; own map registers, so it disappears by itself once they agree --
+       ;; nothing about this notice is hard-coded.
+       (let [{diverged :count :keys [carries missing-from]} divergence]
+         (if (pos? diverged)
+           (format "      <p class=\"tuc-note\"><span class=\"warn\">Register divergence (measured, %d of %d committed records):</span> on approved records this actor's <code>timeuseops.operation/commit-record</code> writes the approver into <code>%s</code> only and leaves <code>%s</code> without it, so the two registers on the SAME record disagree. The store is not at fault — <code>store/commit-record!</code> retains the whole record — but a consumer that reads <code>%s</code> (the obvious register, and the one the “Committed value” column below shows) sees a record byte-identical in shape to an auto-committed one, which makes “a human approved this” and “nobody approved this” indistinguishable downstream. The “Approved by” column therefore names the register it recovered the approver from. This paragraph is derived from the records at build time and will stop appearing once every register carries the approver.</p>\n"
+                   diverged (:records retention)
+                   (esc (str/join ", " carries))
+                   (esc (str/join ", " missing-from))
+                   (esc (str/join ", " missing-from)))
+           (format "      <p class=\"tuc-note\">Register consistency (measured): every map register on every committed record agrees about approver attribution — no consumer can lose it by reading the wrong one.</p>\n"))))
       (dads-table ["Op" "Household" "Committed value" "Approved by" "Actor"]
                   (commit-rows db runs)))
 
