@@ -396,7 +396,15 @@
 (defn- audit-approvals
   "Approver attribution as the RUN's audit channel saw it, keyed by
   [op household-id]. `:approval-granted` facts never reach the store
-  ledger in this actor, so this is an independent second source."
+  ledger in this actor, so this is an independent second source.
+
+  CAUTION -- this key is NOT unique. The same [op household-id] pair can
+  be both approved (at a phase whose `:auto` set is empty) and later
+  auto-committed (at phase 3), and both produce a committed record. Using
+  it as a per-record fallback therefore mis-attributes a human approver to
+  a record that no human ever touched, which is a worse failure than
+  showing nothing. `commit-rows` consumes this ONLY when the store is
+  measured to retain no approver at all -- see the guard there."
   [runs]
   (reduce (fn [acc {:keys [t op household-id by]}]
             (if (= :approval-granted t)
@@ -602,7 +610,15 @@
   [db runs]
   (let [records (vec (store/coordination-log db))
         commits (filterv #(= :committed (:t %)) (store/ledger db))
-        by-audit (audit-approvals runs)]
+        ;; The audit channel is a LAST-RESORT source, enabled only when the
+        ;; store is measured to carry no approver on any record. Its
+        ;; [op household-id] key is not unique (see `audit-approvals`), so
+        ;; consulting it while the store DOES carry the approver would name
+        ;; a human on records that auto-committed with nobody in the loop.
+        ;; Measured, not assumed: if the commit path stops retaining the
+        ;; approver, this flips on by itself.
+        store-carries-approver? (pos? (:with-approver (store-retention db)))
+        by-audit (when-not store-carries-approver? (audit-approvals runs))]
     (->> (map-indexed
           (fn [i record]
             (let [fact (get commits i)
@@ -617,8 +633,15 @@
                                "</span> <span class=\"muted\">(store · <code>"
                                (esc (kw->s k)) "</code>)</span>")
                         audit-hit (str "<span class=\"ok\">" (esc (str audit-hit))
-                                       "</span> <span class=\"muted\">(audit fact only — store dropped it)</span>")
-                        :else "<span class=\"muted\">none — auto-committed, no human in the loop</span>")
+                                       "</span> <span class=\"warn\">(audit fact only — not on the stored record)</span>")
+                        ;; When the store IS carrying approvers, a record
+                        ;; without one really had no human in the loop.
+                        ;; When it is not, we must NOT claim that -- the
+                        ;; approver may simply be unrecoverable.
+                        store-carries-approver?
+                        "<span class=\"muted\">none — auto-committed, no human in the loop</span>"
+                        :else
+                        "<span class=\"warn\">unknown — the stored record carries no approver register</span>")
                       (esc (or (:actor fact) "")))))
           records)
          (str/join "\n"))))
