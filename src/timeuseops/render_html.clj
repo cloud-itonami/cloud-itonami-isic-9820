@@ -1,0 +1,791 @@
+(ns timeuseops.render-html
+  "Build-time HTML renderer for `docs/samples/operator-console.html`.
+
+  Closes flagship checklist item 2 for this repo: before this namespace
+  existed the repo had a product face (`docs/index.html`) but NO operator
+  console and no generator at all.
+
+  Everything on the page is produced by driving the REAL actor stack --
+  `timeuseops.advisor` -> `timeuseops.governor` -> `timeuseops.phase` ->
+  `timeuseops.operation` (a langgraph-clj StateGraph, run through
+  `langgraph.graph/run*`) -> `timeuseops.store` -- over this repo's own
+  seeded programme-household directory (`timeuseops.store/demo-data`:
+  `household-1` Tanaka, `household-2` Silva, `household-3` Nakamura).
+  Nothing on the page is hand-typed narration: household names, ops,
+  minutes, costs, confidences, violation rules and violation detail text
+  are all read back out of the store and out of each run's `:audit`
+  channel after the graph has actually executed.
+
+  The scenario extends this repo's own `timeuseops.sim` demo driver
+  (`clojure -M:dev:run`, run and read BEFORE writing this file) so that
+  every disposition this actor can reach appears at least once, including
+  all FOUR of the governor's HARD rules, the phase gate's own
+  `:phase-disabled` hold (which is NOT a governor hold), and a human
+  approval REJECTION.
+
+  Determinism: no timestamps and no wall-clock anywhere in the page. This
+  actor's domain is TIME USE, so the distinction matters more here than
+  elsewhere: the dates, minutes and clock times on the page
+  (`2026-07-16`, `minutes 120`, `10:00`) are DOMAIN values carried in the
+  seeded requests and echoed back by the store, and are rendered; the wall
+  clock at which the page was generated is never read at all -- there is
+  no `System/currentTimeMillis`, no `java.time`, no `(new java.util.Date)`
+  anywhere in this namespace. Sets taken from code constants
+  (`governor/allowed-ops`, `phase/phases`) are sorted before rendering,
+  and every map register printed into a table cell is emitted in
+  sorted-key order (Clojure switches map implementation at 8 entries).
+  Two consecutive runs are byte-identical -- verify with
+  `clojure -M:dev:render-html \"$(mktemp -d)/a.html\"` twice and `diff`.
+
+  Styling: self-contained and offline. The console does NOT take a new
+  dependency to obtain CSS -- it inlines the very same デジタル庁
+  デザインシステム (DADS) bundle this repo already vendors into
+  `docs/index.html`, read out of that file at build time, so the console
+  wears the same face the repo already presents and cannot drift from it.
+  Only a small console-specific layer is appended on top, and it
+  references DADS custom properties that the vendored bundle defines.
+
+  Build-time invariant: `-main` THROWS if the run produced zero
+  `:governor-hold` facts, or zero HARD (rule-bearing) governor holds. A
+  console that quietly stopped exercising the compliance layer is a
+  broken build, not a clean one.
+
+  Usage: `clojure -M:dev:render-html [out-file]`
+  (default `docs/samples/operator-console.html`)."
+  (:require [clojure.java.io :as io]
+            [clojure.set :as set]
+            [clojure.string :as str]
+            [langgraph.graph :as g]
+            [timeuseops.advisor :as advisor]
+            [timeuseops.governor :as governor]
+            [timeuseops.operation :as op]
+            [timeuseops.phase :as phase]
+            [timeuseops.store :as store]))
+
+;; ----------------------------- styling -----------------------------
+;;
+;; The console is self-contained and offline, and takes NO new dependency
+;; to get there. `docs/index.html` -- this repo's product face -- already
+;; vendors the デジタル庁デザインシステム (DADS) bundle inline; the console
+;; reads that same bundle back out at build time. One vendored copy, one
+;; face: restyling the product face restyles the console with it, and the
+;; console can never quietly drift onto a different design system.
+
+(def ^:private product-face-path
+  "The repo's own product face, whose inline <style> block is the vendored
+  DADS bundle the console re-uses."
+  "docs/index.html")
+
+(defn- vendored-dads-css
+  "The DADS bundle `docs/index.html` already vendors, extracted from its
+  inline <style> block.
+
+  Throws rather than degrading: a console that silently rendered unstyled
+  because the face moved or was regenerated without CSS would still look
+  like a successful build, and 'could not read the stylesheet' must not
+  return the same result as 'read it and it was fine'."
+  []
+  (let [f (io/file product-face-path)]
+    (when-not (.exists f)
+      (throw (ex-info (str "render-html: " product-face-path " not found -- the console re-uses"
+                           " the DADS CSS this repo vendors there. Run from the repo root.")
+                      {:path product-face-path :cwd (System/getProperty "user.dir")})))
+    (let [html  (slurp f)
+          open  (str/index-of html "<style>")
+          close (str/index-of html "</style>")]
+      (when-not (and open close (< open close))
+        (throw (ex-info (str "render-html: no inline <style> block in " product-face-path
+                             " -- refusing to write a console that would render unstyled.")
+                        {:path product-face-path :bytes (count html)})))
+      (let [css (subs html (+ open (count "<style>")) close)]
+        (when (< (count css) 1000)
+          (throw (ex-info (str "render-html: the <style> block in " product-face-path
+                               " is implausibly small; refusing to claim the console is styled.")
+                          {:css-bytes (count css)})))
+        css))))
+
+(def ^:private console-css
+  "The console-only layer, on top of the vendored DADS bundle. Every custom
+  property referenced here is defined by that bundle (verified by the
+  `var(--...)` check in the flagship verification pass)."
+  "
+.tuc-page { padding-block: 2rem 4rem; }
+.tuc-header { padding-block: 2rem 1rem; }
+.tuc-header .dads-heading { margin: 0 0 .75rem; }
+.tuc-section { padding-block: 2rem; border-top: 1px solid var(--color-neutral-solid-gray-200); }
+.tuc-section:first-of-type { border-top: none; }
+.tuc-section > h2 { font-size: 1.375rem; font-weight: bold; margin: 0 0 .75rem;
+  color: var(--color-neutral-solid-gray-900); }
+.tuc-section > p { margin: 0 0 1rem; line-height: 1.8; }
+.tuc-note { color: var(--color-neutral-solid-gray-600); font-size: .9375rem; line-height: 1.8; }
+.tuc-footer { border-top: 1px solid var(--color-neutral-solid-gray-200); margin-top: 2rem;
+  padding-block: 1.5rem 3rem; color: var(--color-neutral-solid-gray-600);
+  font-size: .875rem; line-height: 1.8; }
+.tuc-footer p { margin: 0; }
+.ok { color: var(--color-semantic-success-1); font-weight: bold; }
+.warn { color: var(--color-primitive-yellow-1000); font-weight: bold; }
+.critical { color: var(--color-semantic-error-1); font-weight: bold; }
+.muted { color: var(--color-neutral-solid-gray-600); }
+.dads-table { width: 100%; }
+")
+
+;; ----------------------------- scenario -----------------------------
+
+(defn- ctx
+  "Actor context. `phase` is the rollout phase this particular request is
+  submitted under -- the console shows the phase gate biting at 1 and 2."
+  [actor-id role ph]
+  {:actor-id actor-id :actor-role role :phase ph})
+
+(defn- exec!
+  "One supervised actor run through the real compiled graph. Returns the
+  run's own `:audit` channel plus the label/context, so the console can
+  show the facts the graph emitted that the STORE ledger never receives
+  (`:advisor-proposal`, `:approval-requested`, `:approval-granted` are
+  audit-channel-only in this actor -- see `ledger-coverage` below, which
+  measures that rather than asserting it)."
+  [actor tid label request context]
+  (let [r (g/run* actor {:request request :context context} {:thread-id tid})]
+    {:thread tid :label label :request request :context context
+     :audit (get-in r [:state :audit])
+     :disposition (get-in r [:state :disposition])
+     :verdict (get-in r [:state :verdict])
+     :status (:status r)}))
+
+(defn- resume!
+  "Human operator resumes a paused (`interrupt-before #{:request-approval}`)
+  run with an approval decision."
+  [actor tid status by]
+  (let [r (g/run* actor {:approval {:status status :by by}}
+                  {:thread-id tid :resume? true})]
+    {:thread tid :resume {:status status :by by}
+     :audit (get-in r [:state :audit])
+     :disposition (get-in r [:state :disposition])
+     :status (:status r)}))
+
+(defn run-demo!
+  "Drives a freshly seeded store through a scenario that reaches every
+  disposition this actor can produce. Returns `{:db .. :runs [..]}`.
+
+  Committed / approved:
+    - household-1, phase 1 `:log-time-use-record` -- phase 1 enables the
+      op but has an EMPTY `:auto` set, so a governor-clean proposal still
+      escalates (`:phase-approval`); the survey coordinator approves.
+    - household-1, phase 3 `:log-time-use-record` -- clean and
+      high-confidence, auto-commits with no human in the loop.
+    - household-1, phase 3 `:schedule-survey-visit` -- auto-commits.
+    - household-1, phase 3 `:coordinate-programme-support` at cost 40,
+      under `governor/support-cost-threshold` -- auto-commits.
+    - household-1, phase 3 `:coordinate-programme-support` at cost 850,
+      OVER the threshold -- escalates for budget sign-off; approved by a
+      different human than the coordinator.
+    - household-1, phase 3 `:flag-welfare-concern` -- ALWAYS escalates at
+      every phase (governor `always-escalate-ops` AND the phase table's
+      `:auto` set agree, independently); the welfare triage lead approves
+      the routing-to-human-triage, which is all this op ever does.
+    - household-2, phase 3 `:log-time-use-record` -- auto-commits.
+    - household-2, phase 2 `:schedule-survey-visit` -- phase 2 enables the
+      op, `:auto` is still empty, so it escalates and is approved.
+
+  Held (six holds, three distinct kinds):
+    - household-2, phase 3 `:coordinate-programme-support` at cost 480 --
+      escalates, and the human REJECTS it. `:approval-rejected`, basis
+      `:approver-rejected`. Not a governor hold.
+    - household-2, phase 1 `:schedule-survey-visit` -- the op is not in
+      phase 1's `:writes` set, so the PHASE GATE holds it
+      (`:phase-disabled`). The governor itself was clean; the hold fact
+      carries an empty `:basis`. Distinguished from a HARD hold on the
+      page rather than being lumped in with one.
+    - household-3 (registered but NOT verified), phase 3
+      `:log-time-use-record` -- HARD `:household-unverified`.
+    - household-99 (not in the programme directory at all), phase 3
+      `:log-time-use-record` -- HARD `:household-unverified`.
+    - household-1, phase 3 `:schedule-survey-visit` with a COMPROMISED
+      advisor that claims `:effect :commit` -- HARD `:effect-not-propose`.
+      Uses this repo's own `advisor/Advisor` injection seam, exactly as
+      `timeuseops.sim` does.
+    - household-2, phase 3 with an advisor that has drifted OUTSIDE the
+      closed four-op allowlist and proposes to pay the household
+      compensation for its unpaid work -- HARD `:op-not-allowed`. (This
+      actor is a statistical coordinator; it has no authority to decide a
+      transfer to a household, and the allowlist is what says so.)
+    - household-2, phase 3 `:flag-welfare-concern` whose advisor drifted
+      into finalization language -- HARD
+      `:welfare-intervention-finalization-blocked`. Deliberately staged on
+      the op most at risk of that drift: the one legitimately allowed to
+      say 'welfare'."
+  []
+  (let [db          (store/seed-db)
+        actor       (op/build db)
+        coord-p1    (ctx "coord-1" :survey-coordinator 1)
+        coord-p2    (ctx "coord-1" :survey-coordinator 2)
+        coord-p3    (ctx "coord-1" :survey-coordinator 3)
+        ;; a compromised advisor claiming a direct actuation
+        actor-direct
+        (op/build db {:advisor (reify advisor/Advisor
+                                 (-advise [_ _ req]
+                                   (assoc (advisor/infer nil req) :effect :commit)))})
+        ;; an advisor that has drifted outside the closed op allowlist
+        actor-off-allowlist
+        (op/build db {:advisor (reify advisor/Advisor
+                                 (-advise [_ _ req]
+                                   (-> (advisor/infer nil (assoc req :op :coordinate-programme-support))
+                                       (assoc :op :issue-household-compensation
+                                              :summary (str (:household-id req)
+                                                            " の無償家事労働に対する補償金の支給を提案")
+                                              :rationale "記録された無償労働時間に基づき世帯へ金銭を支給する提案。この actor は統計調整専用であり、世帯への給付を決定する権限を持たない。"))))})
+        runs (atom [])
+        record! (fn [r] (swap! runs conj r) r)]
+
+    ;; --- committed / approved -------------------------------------------
+    (record! (exec! actor "h1-log-p1" "phase-1 time-use log (phase gate escalates)"
+                    {:op :log-time-use-record :household-id "household-1"
+                     :patch {:date "2026-07-16" :activity "eldercare" :minutes 120}}
+                    coord-p1))
+    (record! (resume! actor "h1-log-p1" :approved "survey-coordinator-1"))
+
+    (record! (exec! actor "h1-log-p3" "phase-3 time-use log (auto-commit)"
+                    {:op :log-time-use-record :household-id "household-1"
+                     :patch {:date "2026-07-17" :activity "childcare" :minutes 95}}
+                    coord-p3))
+
+    (record! (exec! actor "h1-visit-p3" "phase-3 enumerator visit (auto-commit)"
+                    {:op :schedule-survey-visit :household-id "household-1"
+                     :patch {:enumerator "field-officer-3" :date "2026-07-20" :time "10:00"}}
+                    coord-p3))
+
+    (record! (exec! actor "h1-support-under" "programme support under cost threshold (auto-commit)"
+                    {:op :coordinate-programme-support :household-id "household-1"
+                     :patch {:material "diary-booklets" :quantity 2 :cost 40}}
+                    coord-p3))
+
+    (record! (exec! actor "h1-support-over" "programme support OVER cost threshold (budget sign-off)"
+                    {:op :coordinate-programme-support :household-id "household-1"
+                     :patch {:material "enumerator-training" :quantity 1 :cost 850}}
+                    coord-p3))
+    (record! (resume! actor "h1-support-over" :approved "programme-director-1"))
+
+    (record! (exec! actor "h1-welfare" "welfare concern flag (always escalates)"
+                    {:op :flag-welfare-concern :household-id "household-1"
+                     :patch {:concern "enumerator observed an unattended elder during the visit"
+                             :confidence 0.92}}
+                    coord-p3))
+    (record! (resume! actor "h1-welfare" :approved "welfare-triage-lead-1"))
+
+    (record! (exec! actor "h2-log-p3" "phase-3 time-use log (auto-commit)"
+                    {:op :log-time-use-record :household-id "household-2"
+                     :patch {:date "2026-07-18" :activity "meal preparation" :minutes 55}}
+                    coord-p3))
+
+    (record! (exec! actor "h2-visit-p2" "phase-2 enumerator visit (phase gate escalates)"
+                    {:op :schedule-survey-visit :household-id "household-2"
+                     :patch {:enumerator "field-officer-7" :date "2026-07-21" :time "14:30"}}
+                    coord-p2))
+    (record! (resume! actor "h2-visit-p2" :approved "survey-coordinator-1"))
+
+    ;; --- human rejection --------------------------------------------------
+    (record! (exec! actor "h2-support-rejected" "programme support OVER threshold (human rejects)"
+                    {:op :coordinate-programme-support :household-id "household-2"
+                     :patch {:material "tablet-diary-devices" :quantity 4 :cost 480}}
+                    coord-p3))
+    (record! (resume! actor "h2-support-rejected" :rejected "programme-director-1"))
+
+    ;; --- phase-gate hold (NOT a governor hold) ----------------------------
+    (record! (exec! actor "h2-visit-p1" "phase-1 enumerator visit (op not yet enabled)"
+                    {:op :schedule-survey-visit :household-id "household-2"
+                     :patch {:enumerator "field-officer-7" :date "2026-07-19"}}
+                    coord-p1))
+
+    ;; --- HARD governor holds ----------------------------------------------
+    (record! (exec! actor "h3-unverified" "unverified household (HARD)"
+                    {:op :log-time-use-record :household-id "household-3"
+                     :patch {:date "2026-07-18" :activity "cleaning" :minutes 40}}
+                    coord-p3))
+
+    (record! (exec! actor "h99-unregistered" "unregistered household (HARD)"
+                    {:op :log-time-use-record :household-id "household-99"
+                     :patch {:date "2026-07-18" :activity "childcare" :minutes 60}}
+                    coord-p3))
+
+    (record! (exec! actor-direct "h1-direct-actuation" "advisor claims :effect :commit (HARD)"
+                    {:op :schedule-survey-visit :household-id "household-1"
+                     :patch {:enumerator "field-officer-1" :date "2026-07-22"}}
+                    coord-p3))
+
+    (record! (exec! actor-off-allowlist "h2-off-allowlist" "advisor proposes an op outside the allowlist (HARD)"
+                    {:op :issue-household-compensation :household-id "household-2"
+                     :patch {:amount 25000 :currency "JPY"}}
+                    coord-p3))
+
+    (record! (exec! actor "h2-scope-drift" "advisor drifts into finalizing a welfare intervention (HARD)"
+                    {:op :flag-welfare-concern :household-id "household-2"
+                     :out-of-scope? true
+                     :patch {:concern "enumerator observed a child alone after school"
+                             :confidence 0.88}}
+                    coord-p3))
+
+    {:db db :runs @runs}))
+
+;; ----------------------------- derivation -----------------------------
+
+(defn- esc [v]
+  (-> (str v)
+      (str/replace "&" "&amp;")
+      (str/replace "<" "&lt;")
+      (str/replace ">" "&gt;")))
+
+(defn- kw->s [k] (if (keyword? k) (name k) (str k)))
+
+(defn- sorted-map-str
+  "Render a small map register in sorted-key order (deterministic
+  regardless of Clojure's map implementation switching at 8 entries)."
+  [m]
+  (if (map? m)
+    (->> m
+         (sort-by (comp str key))
+         (map (fn [[k v]] (str (kw->s k) "=" (if (string? v) v (pr-str v)))))
+         (str/join ", "))
+    (str m)))
+
+(defn- run-audit
+  "Every audit fact every run in this scenario emitted, in run order."
+  [runs]
+  (vec (mapcat :audit runs)))
+
+(defn- hold-facts [ledger]
+  (filterv #(#{:governor-hold :approval-rejected} (:t %)) ledger))
+
+(defn- hard-hold? [f]
+  (and (= :governor-hold (:t f)) (seq (:basis f))))
+
+(defn- phase-gate-hold? [f]
+  (and (= :governor-hold (:t f)) (empty? (:basis f)) (:phase-reason f)))
+
+(defn- hold-kind [f]
+  (cond (hard-hold? f)       ["critical" "HARD · governor"]
+        (phase-gate-hold? f) ["warn" "phase gate"]
+        (= :approval-rejected (:t f)) ["warn" "human rejection"]
+        :else                ["muted" "hold"]))
+
+(def ^:private approver-key-marker "approv")
+
+(defn- approver-keys-in
+  "Scan one map for keys whose NAME carries approver attribution. Derived,
+  not hardcoded: if the store's commit path is later changed to retain a
+  different key, this keeps finding it; if it is changed to retain none,
+  this correctly reports none instead of repeating a stale claim."
+  [m]
+  (when (map? m)
+    (->> m
+         (filter (fn [[k _]] (and (keyword? k)
+                                  (str/includes? (str/lower-case (name k))
+                                                 approver-key-marker))))
+         (sort-by (comp str key))
+         vec)))
+
+(defn- record-approver
+  "Approver attribution recoverable from ONE committed record as the store
+  actually retained it: scans every map-valued register on the record
+  (`:value`, `:payload`, ...). Returns `[key value]` or nil."
+  [record]
+  (->> (concat [record] (filter map? (vals record)))
+       (mapcat approver-keys-in)
+       (remove nil?)
+       first))
+
+(defn- audit-approvals
+  "Approver attribution as the RUN's audit channel saw it, keyed by
+  [op household-id]. `:approval-granted` facts never reach the store
+  ledger in this actor, so this is an independent second source."
+  [runs]
+  (reduce (fn [acc {:keys [t op household-id by]}]
+            (if (= :approval-granted t)
+              (update acc [op household-id] (fnil conj []) by)
+              acc))
+          {}
+          (run-audit runs)))
+
+(defn- store-retention
+  "MEASURED at render time -- what this repo's `store/commit-record!`
+  actually retains, rather than an assumption carried over from a sibling
+  repo. Returns counts plus the retained key names."
+  [db]
+  (let [records (vec (store/coordination-log db))
+        found   (keep record-approver records)]
+    {:records (count records)
+     :with-approver (count found)
+     :keys (vec (sort (distinct (map (comp kw->s first) found))))}))
+
+(defn- ledger-coverage
+  "MEASURED at render time -- which fact types the graph emits into a run's
+  `:audit` channel but the STORE ledger never receives. In this actor the
+  `:commit` and `:hold` nodes are the only writers, so proposal and
+  approval facts are audit-channel-only."
+  [db runs]
+  (let [audit-types  (set (map :t (run-audit runs)))
+        ledger-types (set (map :t (store/ledger db)))]
+    {:audit-only (vec (sort (map kw->s (set/difference audit-types ledger-types))))
+     :ledger (vec (sort (map kw->s ledger-types)))}))
+
+;; ----------------------------- sections -----------------------------
+
+(defn- last-fact-for [ledger household-id]
+  (last (filter #(= (:household-id %) household-id) ledger)))
+
+(defn- household-status [ledger household-id]
+  (let [f (last-fact-for ledger household-id)]
+    (cond
+      (nil? f) "<span class=\"muted\">no activity this run</span>"
+      (= :committed (:t f)) "<span class=\"ok\">committed</span>"
+      (hard-hold? f)
+      (str "<span class=\"critical\">HARD hold · "
+           (esc (str/join ", " (map kw->s (:basis f)))) "</span>")
+      (phase-gate-hold? f)
+      (str "<span class=\"warn\">phase-gate hold · "
+           (esc (kw->s (:phase-reason f))) "</span>")
+      (= :approval-rejected (:t f)) "<span class=\"warn\">approval rejected</span>"
+      :else "<span class=\"muted\">held</span>")))
+
+(defn- household-rows [db]
+  (let [ledger (vec (store/ledger db))]
+    (->> (store/all-households db)
+         (map (fn [{:keys [household-id name registered? verified?]}]
+                (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                        (esc household-id) (esc name)
+                        (if registered? "<span class=\"ok\">registered</span>"
+                            "<span class=\"critical\">not registered</span>")
+                        (if verified? "<span class=\"ok\">verified</span>"
+                            "<span class=\"critical\">not verified</span>")
+                        (household-status ledger household-id))))
+         (str/join "\n"))))
+
+(defn- phase-rows
+  "Rollout matrix read straight out of `timeuseops.phase/phases` -- not a
+  hand-written description of it."
+  []
+  (->> (sort-by key phase/phases)
+       (map (fn [[ph {:keys [label writes auto]}]]
+              (format "        <tr><td>%s%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                      ph
+                      (if (= ph phase/default-phase)
+                        " <span class=\"dads-chip-label\" data-style=\"filled-1\" data-color=\"blue\">default</span>" "")
+                      (esc label)
+                      (if (seq writes)
+                        (str/join ", " (map #(str "<code>" (esc (kw->s %)) "</code>")
+                                            (sort (map kw->s writes))))
+                        "<span class=\"muted\">none (read-only)</span>")
+                      (if (seq auto)
+                        (str/join ", " (map #(str "<code>" (esc (kw->s %)) "</code>")
+                                            (sort (map kw->s auto))))
+                        "<span class=\"muted\">none — every write needs a human</span>"))))
+       (str/join "\n")))
+
+(defn- op-gate-rows
+  "Per-op gate, DERIVED from `governor/allowed-ops`,
+  `governor/always-escalate-ops` and the `phase/phases` table."
+  []
+  (let [auto-3 (get-in phase/phases [phase/default-phase :auto])
+        first-writable (fn [o]
+                         (->> (sort-by key phase/phases)
+                              (some (fn [[ph {:keys [writes]}]]
+                                      (when (contains? writes o) ph)))))]
+    (->> (sort-by kw->s governor/allowed-ops)
+         (map (fn [o]
+                (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                        (esc (kw->s o))
+                        (if-let [p (first-writable o)] (str "phase " p) "never")
+                        (if (contains? auto-3 o)
+                          (str "<span class=\"ok\">yes at phase " phase/default-phase "</span>")
+                          "<span class=\"warn\">never — human approval at every phase</span>")
+                        (cond
+                          (contains? governor/always-escalate-ops o)
+                          "<span class=\"warn\">ALWAYS escalates · governor and phase table agree independently</span>"
+                          (= :coordinate-programme-support o)
+                          (str "<span class=\"warn\">escalates when draft <code>:cost</code> &gt; "
+                               governor/support-cost-threshold "</span>")
+                          :else
+                          (str "<span class=\"muted\">escalates below confidence "
+                               governor/confidence-floor "</span>")))))
+         (str/join "\n"))))
+
+(defn- hard-rule-rows
+  "The HARD rules, each shown with the actual violation detail string the
+  governor emitted for it during THIS run (or marked not-exercised)."
+  [db]
+  (let [holds (hold-facts (store/ledger db))
+        by-rule (reduce (fn [acc f]
+                          (reduce (fn [a v] (update a (:rule v) (fnil conj []) [f v]))
+                                  acc (:violations f)))
+                        {} holds)
+        catalogue [[:household-unverified
+                    "対象世帯がプログラムに登録・検証済みであること。提案の自己申告ではなく store の世帯レコードから再導出する。"]
+                   [:effect-not-propose
+                    "すべての提案の :effect は :propose のみ。それ以外はガバナンス外の直接作動の主張。"]
+                   [:op-not-allowed
+                    "四つの許可された操作(closed allowlist)以外は、advisor が権限を持たない提案。"]
+                   [:welfare-intervention-finalization-blocked
+                    "福祉介入(児童・高齢者保護措置/親権関連の強制措置/保護命令)の確定・実行は永久に対象外。op を問わず無条件に走査。"]]]
+    (->> catalogue
+         (map (fn [[rule jp]]
+                (let [hits (get by-rule rule)]
+                  (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                          (esc (kw->s rule))
+                          (esc jp)
+                          (if hits
+                            (str "<span class=\"critical\">" (count hits) " hold(s) this run</span>")
+                            "<span class=\"muted\">not exercised this run</span>")
+                          (if hits
+                            (esc (:detail (second (first hits))))
+                            "<span class=\"muted\">—</span>")))))
+         (str/join "\n"))))
+
+(defn- hold-rows [db]
+  (->> (hold-facts (store/ledger db))
+       (map (fn [{:keys [op household-id actor basis violations confidence phase-reason] :as f}]
+              (let [[cls kind] (hold-kind f)]
+                (format "        <tr><td><span class=\"%s\">%s</span></td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                        cls kind
+                        (esc (kw->s op)) (esc household-id)
+                        (if (seq basis)
+                          (str/join ", " (map #(str "<code>" (esc (kw->s %)) "</code>") basis))
+                          (if phase-reason
+                            (str "<code>" (esc (kw->s phase-reason)) "</code>")
+                            "<span class=\"muted\">—</span>"))
+                        (if (seq violations)
+                          (esc (str/join " / " (map :detail violations)))
+                          "<span class=\"muted\">governor was clean; the rollout phase held it</span>")
+                        (str (esc actor) (when confidence (str " · conf " confidence)))))))
+       (str/join "\n")))
+
+(defn- commit-rows
+  "The committed coordination log, joined 1:1 with the ledger's
+  `:committed` facts (the `:commit` node writes exactly one of each, in
+  the same order), plus approver attribution derived from whichever source
+  actually retained it."
+  [db runs]
+  (let [records (vec (store/coordination-log db))
+        commits (filterv #(= :committed (:t %)) (store/ledger db))
+        by-audit (audit-approvals runs)]
+    (->> (map-indexed
+          (fn [i record]
+            (let [fact (get commits i)
+                  [k v] (record-approver record)
+                  audit-hit (first (get by-audit [(:op record) (:household-id record)]))]
+              (format "        <tr><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                      (esc (kw->s (:op record)))
+                      (esc (:household-id record))
+                      (esc (sorted-map-str (dissoc (:value record) :household-id)))
+                      (cond
+                        v (str "<span class=\"ok\">" (esc (str v))
+                               "</span> <span class=\"muted\">(store · <code>"
+                               (esc (kw->s k)) "</code>)</span>")
+                        audit-hit (str "<span class=\"ok\">" (esc (str audit-hit))
+                                       "</span> <span class=\"muted\">(audit fact only — store dropped it)</span>")
+                        :else "<span class=\"muted\">none — auto-committed, no human in the loop</span>")
+                      (esc (or (:actor fact) "")))))
+          records)
+         (str/join "\n"))))
+
+(defn- ledger-rows [db]
+  (->> (store/ledger db)
+       (map (fn [{:keys [t op household-id disposition basis]}]
+              (format "        <tr><td>%s</td><td><code>%s</code></td><td><code>%s</code></td><td>%s</td><td>%s</td></tr>"
+                      (esc (kw->s t)) (esc (kw->s op)) (esc household-id)
+                      (esc (kw->s (or disposition "")))
+                      (if (seq basis)
+                        (esc (str/join ", " (map kw->s basis)))
+                        "<span class=\"muted\">—</span>"))))
+       (str/join "\n")))
+
+(defn- trace-rows
+  "Per-run trace built from each `g/run*` result: the graph's own
+  disposition, its run status, and the audit facts it emitted -- including
+  the ones the store ledger never sees."
+  [runs]
+  (->> runs
+       (map (fn [{:keys [thread label resume disposition status audit request]}]
+              (format "        <tr><td><code>%s</code></td><td>%s</td><td>%s</td><td>%s</td><td>%s</td><td>%s</td></tr>"
+                      (esc thread)
+                      (if resume
+                        (str "<span class=\"muted\">resume · </span>"
+                             (esc (kw->s (:status resume))) " by <code>"
+                             (esc (:by resume)) "</code>")
+                        (esc label))
+                      (if request
+                        (str "phase " (esc (get-in request [:context :phase] "")) "")
+                        "")
+                      (case disposition
+                        :commit "<span class=\"ok\">commit</span>"
+                        :hold "<span class=\"critical\">hold</span>"
+                        :escalate "<span class=\"warn\">escalate</span>"
+                        (str "<span class=\"muted\">" (esc (kw->s (or disposition ""))) "</span>"))
+                      (esc (kw->s (or status "")))
+                      (esc (str/join ", " (map (comp kw->s :t) audit))))))
+       (str/join "\n")))
+
+;; ----------------------------- document -----------------------------
+
+(defn- dads-table
+  "One table, in the vendored DADS table component's own markup
+  (`.dads-table` wrapper + `.dads-table__table` + `.dads-table__col-header`
+  headers) rather than a hand-rolled table restyled to look like it."
+  [headers rows-html]
+  (str "      <div class=\"dads-table\" data-size=\"dense\" data-row-stripe>\n"
+       "        <table class=\"dads-table__table\" data-width=\"full\" data-cell-border=\"bottom\">\n"
+       "          <thead><tr>"
+       (str/join (map #(str "<th class=\"dads-table__col-header\" scope=\"col\">" % "</th>")
+                      headers))
+       "</tr></thead>\n"
+       "          <tbody>\n"
+       rows-html "\n"
+       "          </tbody>\n"
+       "        </table>\n"
+       "      </div>\n"))
+
+(defn- section
+  "One console section: heading, prose, then the table."
+  [title prose table-html]
+  (str "    <section class=\"tuc-section\">\n"
+       "      <h2>" title "</h2>\n"
+       prose
+       table-html
+       "    </section>\n"))
+
+(defn render
+  "Renders the whole console from a completed `run-demo!` result."
+  [{:keys [db runs]}]
+  (let [ledger      (vec (store/ledger db))
+        holds       (hold-facts ledger)
+        hard        (filterv hard-hold? holds)
+        retention   (store-retention db)
+        coverage    (ledger-coverage db runs)
+        hard-rules  (vec (sort (distinct (mapcat #(map kw->s (:basis %)) hard))))
+        ;; every run that actually paused for a human
+        escalations (count (filter #(= :approval-requested (:t %)) (run-audit runs)))]
+    (str
+     "<!DOCTYPE html>\n"
+     "<html lang=\"en\"><head><meta charset=\"utf-8\">"
+     "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1, viewport-fit=cover\">"
+     "<meta name=\"color-scheme\" content=\"light\">"
+     "<title>cloud-itonami-isic-9820 · household time-use survey programme — Operator Console</title>"
+     "<style>" (vendored-dads-css) console-css "</style></head><body>\n"
+     "<div class=\"dds-ext-container tuc-page\">\n"
+     "  <header class=\"tuc-header\">\n"
+     "    <h1 class=\"dads-heading\" data-size=\"45\">Undifferentiated service-producing activities of private households for own use (ISIC 9820) — Operator Console</h1>\n"
+     "    <span class=\"dads-chip-label\" data-style=\"filled-1\" data-color=\"blue\">coordination-only · governor-gated · welfare-intervention finalization permanently out of scope</span>\n"
+     "  </header>\n"
+     "  <main>\n"
+
+     (section
+      "What this actor is (and is not)"
+      (str
+       "      <p>ISIC 9820 is a UN System of National Accounts bookkeeping class for own-account, non-market service production — unpaid domestic and care work a household performs for its own members. There is no market business that <em>is</em> a 9820 entity, so this actor is scoped honestly as the back-office coordinator of a national-statistics-office style <strong>time-use survey programme</strong>: time-use-diary logging, enumerator visit scheduling, programme-support coordination, and welfare-concern flagging for human triage.</p>\n"
+       "      <p class=\"tuc-note\">It does not employ, pay or supervise household workers; it does not sell household services; and it never finalizes a welfare-intervention decision of any kind. Every figure below was produced by running the real actor — <code>timeuseops.advisor</code> → <code>timeuseops.governor</code> → <code>timeuseops.phase</code> → <code>timeuseops.operation</code> (langgraph <code>run*</code>) → <code>timeuseops.store</code> — at build time via <code>clojure -M:dev:render-html</code>. Nothing here is narrated.</p>\n"
+       "      <p class=\"tuc-note\">The dates, minutes and clock times below are DOMAIN values from the seeded requests, echoed back out of the store. The wall clock at which this page was generated is never read — a time-use actor has to keep those two kinds of time apart, so the page carries no generation timestamp at all and two consecutive builds are byte-identical.</p>\n")
+      (dads-table
+       ["Measure" "This run"]
+       (str/join
+        "\n"
+        [(format "            <tr><td>Supervised actor runs (incl. human resumes)</td><td>%d</td></tr>" (count runs))
+         (format "            <tr><td>Ledger facts written to the store</td><td>%d</td></tr>" (count ledger))
+         (format "            <tr><td>Committed coordination records</td><td>%d</td></tr>" (:records retention))
+         (format "            <tr><td>Escalations that paused for a human</td><td>%d</td></tr>" escalations)
+         (format "            <tr><td>Holds</td><td>%d (<span class=\"critical\">%d HARD governor</span>, %d other)</td></tr>"
+                 (count holds) (count hard) (- (count holds) (count hard)))
+         (format "            <tr><td>Distinct HARD rules that fired</td><td><span class=\"critical\">%s</span></td></tr>"
+                 (esc (str/join ", " hard-rules)))])))
+
+     (section
+      "Programme households"
+      "      <p class=\"tuc-note\">The seeded programme-enrollment directory (<code>timeuseops.store/demo-data</code>). A household must be independently <code>:registered?</code> AND <code>:verified?</code> in the store before any proposal for it may commit — or even escalate. The governor re-derives this from the store record, never from the proposal's own claim.</p>\n"
+      (dads-table ["Household" "Name" "Registered" "Verified" "Last outcome this run"]
+                  (household-rows db)))
+
+     (section
+      "HARD governor rules"
+      "      <p class=\"tuc-note\">Permanent and un-overridable: no human approval can release one. The detail column is the governor's own violation string as emitted during this run, not a paraphrase.</p>\n"
+      (dads-table ["Rule" "What it enforces" "Exercised" "Detail emitted this run"]
+                  (hard-rule-rows db)))
+
+     (section
+      "Holds this run"
+      "      <p class=\"tuc-note\">Three different things can stop a proposal, and the console keeps them apart: a <span class=\"critical\">HARD governor rule</span> (permanent), the <span class=\"warn\">rollout phase gate</span> (the op is not enabled yet — the governor itself was clean), and a <span class=\"warn\">human rejection</span> at the approval interrupt.</p>\n"
+      (dads-table ["Kind" "Op" "Household" "Basis" "Detail" "Actor"]
+                  (hold-rows db)))
+
+     (section
+      "Action gate — per op"
+      "      <p class=\"tuc-note\">Derived from <code>governor/allowed-ops</code>, <code>governor/always-escalate-ops</code> and the <code>phase/phases</code> table, so it cannot drift from the code. <code>:flag-welfare-concern</code> is absent from every phase's <code>:auto</code> set AND is in the governor's always-escalate set — two independent layers agree that it never auto-commits.</p>\n"
+      (dads-table ["Op" "First writable at" "Auto-commit eligible" "Escalation rule"]
+                  (op-gate-rows)))
+
+     (section
+      "Rollout phases"
+      "      <p class=\"tuc-note\">Read out of <code>timeuseops.phase/phases</code> at build time.</p>\n"
+      (dads-table ["Phase" "Label" "Writable ops" "Auto-commit eligible"]
+                  (phase-rows)))
+
+     (section
+      "Committed coordination log"
+      (str
+       "      <p class=\"tuc-note\">Every record <code>timeuseops.store/commit-record!</code> actually retained, joined 1:1 with the ledger's <code>:committed</code> facts.</p>\n"
+       "      <p>"
+       (if (pos? (:with-approver retention))
+         (format "<strong>Approver attribution — measured, not assumed:</strong> this repo's store DOES retain it. %d of %d committed records carry an approver key (<code>%s</code>) on the record's own registers, so the human who released an escalation is recoverable from the store alone. The remaining %d were auto-committed at phase %d with no human in the loop — absent because nobody approved, not because the store dropped it."
+                 (:with-approver retention) (:records retention)
+                 (esc (str/join ", " (:keys retention)))
+                 (- (:records retention) (:with-approver retention))
+                 phase/default-phase)
+         (format "<strong>Approver attribution — measured, not assumed:</strong> this repo's store retains NO approver key on any of its %d committed records, so the approver is not recoverable from the store. Where a run's audit channel carried an <code>:approval-granted</code> fact, the name below is joined from there instead and labelled as such."
+                 (:records retention)))
+       "</p>\n")
+      (dads-table ["Op" "Household" "Committed value" "Approved by" "Actor"]
+                  (commit-rows db runs)))
+
+     (section
+      "Audit ledger (store)"
+      (str
+       "      <p class=\"tuc-note\">The append-only decision-fact log as the store holds it. "
+       (format "Fact types the store ledger receives: <code>%s</code>. Fact types the graph emitted into a run's <code>:audit</code> channel that the ledger never receives: <code>%s</code> — in this actor only the <code>:commit</code> and <code>:hold</code> nodes write to the store, so proposal and approval facts live on the run result only. That is measured at render time by differencing the two sets, not asserted."
+               (esc (str/join ", " (:ledger coverage)))
+               (esc (str/join ", " (:audit-only coverage))))
+       "</p>\n")
+      (dads-table ["Fact" "Op" "Household" "Disposition" "Basis"]
+                  (ledger-rows db)))
+
+     (section
+      "Run trace"
+      "      <p class=\"tuc-note\">One row per <code>langgraph.graph/run*</code> call, including the human resumes through the <code>interrupt-before #{:request-approval}</code> gate.</p>\n"
+      (dads-table ["Thread" "Scenario" "Phase" "Disposition" "Run status" "Audit facts emitted"]
+                  (trace-rows runs)))
+
+     "  </main>\n"
+     "  <footer class=\"tuc-footer\"><p>Generated by <code>timeuseops.render-html</code> (<code>clojure -M:dev:render-html</code>) from a live run of this repo's actor over <code>timeuseops.store/demo-data</code>. Styled with the same デジタル庁デザインシステム bundle this repo vendors into <code>docs/index.html</code>, inlined — no network, no extra dependency. Deterministic: no timestamps, no wall-clock, sorted set rendering — two consecutive runs are byte-identical. Read-only sample.</p></footer>\n"
+     "</div>\n"
+     "</body></html>\n")))
+
+(defn -main [& args]
+  (let [out    (or (first args) "docs/samples/operator-console.html")
+        result (run-demo!)
+        db     (:db result)
+        ledger (vec (store/ledger db))
+        gov    (filterv #(= :governor-hold (:t %)) ledger)
+        hard   (filterv hard-hold? ledger)]
+    ;; Build-time invariant. A console generated from a run that never
+    ;; exercised the compliance layer is not evidence of anything.
+    (when (zero? (count gov))
+      (throw (ex-info "render-html: the demo run produced ZERO :governor-hold records — the console would show a compliance layer that was never exercised. Refusing to write it."
+                      {:ledger-facts (count ledger)
+                       :fact-types (vec (sort (map name (distinct (map :t ledger)))))})))
+    (when (zero? (count hard))
+      (throw (ex-info "render-html: the demo run produced ZERO HARD (rule-bearing) governor holds — every hold was a phase-gate or human rejection. Refusing to write it."
+                      {:governor-holds (count gov)
+                       :bases (vec (map :basis gov))})))
+    (io/make-parents out)
+    (spit out (render result))
+    (println "wrote" out
+             (str "(" (count ledger) " ledger facts, "
+                  (count (store/coordination-log db)) " committed records, "
+                  (count gov) " governor holds of which " (count hard) " HARD: "
+                  (str/join ", " (sort (distinct (mapcat #(map name (:basis %)) hard))))
+                  ")"))))
