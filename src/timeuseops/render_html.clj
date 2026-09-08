@@ -54,7 +54,7 @@
   (default `docs/samples/operator-console.html`)."
   (:require [clojure.java.io :as io]
             [clojure.set :as set]
-            [clojure.string :as str]
+            [kotoba.lang.text :as str]
             [langgraph.graph :as g]
             [timeuseops.advisor :as advisor]
             [timeuseops.governor :as governor]
@@ -378,7 +378,7 @@
   (when (map? m)
     (->> m
          (filter (fn [[k _]] (and (keyword? k)
-                                  (str/includes? (str/lower-case (name k))
+                                  (str/includes? (str/lower (name k))
                                                  approver-key-marker))))
          (sort-by (comp str key))
          vec)))

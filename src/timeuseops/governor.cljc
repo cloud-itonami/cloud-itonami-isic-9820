@@ -79,7 +79,7 @@
     - `:coordinate-programme-support` whose draft `:value` `:cost` exceeds
       `support-cost-threshold` escalates for human budget sign-off.
     - LLM confidence below `confidence-floor` also always escalates."
-  (:require [clojure.string :as str]
+  (:require [kotoba.lang.text :as str]
             [timeuseops.store :as store]))
 
 (def confidence-floor 0.6)
@@ -155,7 +155,7 @@
   "Flatten every advisor-authored field on a proposal into one lower-cased
   blob the welfare-intervention-finalization scan checks."
   [proposal]
-  (str/lower-case (pr-str (select-keys proposal [:op :summary :rationale :cites :value]))))
+  (str/lower (pr-str (select-keys proposal [:op :summary :rationale :cites :value]))))
 
 (defn- welfare-intervention-finalization-violations
   "HARD, PERMANENT block: a proposal whose content uses finalization/
