@@ -81,11 +81,11 @@ clojure -M:run
 
 ## Test suite
 
-- `test/timeuseops/governor_test.clj` — unit tests of governor hard checks, welfare-intervention-finalization block, and the dedicated self-trip regression test
-- `test/timeuseops/advisor_test.clj` — advisor proposal shape and consistency
-- `test/timeuseops/phase_test.clj` — rollout phase logic
-- `test/timeuseops/governor_contract_test.clj` — full graph integration, audit trail
-- `test/timeuseops/store_contract_test.clj` — Store protocol and MemStore implementation
+- `test/timeuseops/governor_test.kotoba` — unit tests of governor hard checks, welfare-intervention-finalization block, and the dedicated self-trip regression test
+- `test/timeuseops/advisor_test.kotoba` — advisor proposal shape and consistency
+- `test/timeuseops/phase_test.kotoba` — rollout phase logic
+- `test/timeuseops/governor_contract_test.kotoba` — full graph integration, audit trail
+- `test/timeuseops/store_contract_test.kotoba` — Store protocol and MemStore implementation
 
 ## Modules
 
